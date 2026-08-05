@@ -87,13 +87,27 @@ const fn system_default_data_dir() -> &'static str {
 }
 
 lazy_static! {
+    /// Namespace for this fork's IPC sockets.
+    ///
+    /// FORK: the `_remote` suffix keeps this build's sessions in a directory of
+    /// their own. Upstream Zellij finds sessions by scanning this directory, so
+    /// sharing it would mean the remote-control API could list, drive and kill
+    /// a person's ordinary `zellij` sessions — and that an upstream client
+    /// could attach to an API-driven one across a version boundary. Separating
+    /// the namespace makes that impossible rather than merely discouraged.
     pub static ref CLIENT_SERVER_CONTRACT_DIR: String =
-        format!("contract_version_{}", CLIENT_SERVER_CONTRACT_VERSION);
+        format!("contract_version_{}_remote", CLIENT_SERVER_CONTRACT_VERSION);
+    /// FORK: distinct from upstream's `Zellij` so the runtime directory (which
+    /// is where sockets live) and the cache directory (session metadata,
+    /// resurrection layouts, plugin artifacts) are this build's alone. This is
+    /// the second, independent half of the isolation: even if `ZELLIJ_SOCKET_DIR`
+    /// is pointed at upstream's directory, the contract subdirectory above
+    /// still keeps the two apart.
     pub static ref ZELLIJ_PROJ_DIR: ProjectDirs = {
         if cfg!(windows) {
-            ProjectDirs::from("", "", "Zellij").unwrap()
+            ProjectDirs::from("", "", "ZellijRemote").unwrap()
         } else {
-            ProjectDirs::from("org", "Zellij Contributors", "Zellij").unwrap()
+            ProjectDirs::from("org", "Zellij Contributors", "ZellijRemote").unwrap()
         }
     };
     pub static ref ZELLIJ_CACHE_DIR: PathBuf = ZELLIJ_PROJ_DIR.cache_dir().to_path_buf();

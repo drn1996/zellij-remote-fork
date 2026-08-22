@@ -139,6 +139,20 @@ pub enum Command {
         pane_id: String,
         name: String,
     },
+    /// Resize what the session renders at, by resizing its focus client.
+    ///
+    /// Distinct from `pane.resize`, which moves a split boundary between
+    /// panes: this changes the terminal geometry the whole session is laid
+    /// out for. Omit `rows`/`cols` to restore the default (see
+    /// `session_link::default_focus_size`).
+    #[serde(rename = "session.resize")]
+    SessionResize {
+        session: String,
+        #[serde(default)]
+        rows: Option<usize>,
+        #[serde(default)]
+        cols: Option<usize>,
+    },
     #[serde(rename = "pane.resize")]
     PaneResize {
         session: String,

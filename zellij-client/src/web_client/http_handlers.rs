@@ -1,6 +1,7 @@
 use crate::web_client::authentication::{IsReadOnly, SessionTokenHash};
 use crate::web_client::control_message::SetConfigPayload;
 use crate::web_client::types::{
+    OpenSessionQuery,
     record_pending_welcome_session, AppState, CreateClientIdResponse, LoginRequest, LoginResponse,
     SessionListResponse, SessionQuery,
 };
@@ -34,6 +35,59 @@ pub async fn serve_html() -> impl IntoResponse {
             "index.html missing".as_bytes(),
         ),
     }
+}
+
+/// Opens a session from a plain link, authenticating on the way in.
+///
+/// `POST /command/login` is the real login, and a POST with a JSON body is
+/// not something an `<a href>` can do — so a link straight to `/{session}`
+/// always landed on the token prompt, and "open this worker" meant pasting
+/// a token first. This is the same login, reachable by clicking: it takes
+/// the token as a query parameter, sets the same cookie, and redirects to
+/// the session.
+///
+/// `remember_me` is deliberately on. Without it the cookie dies with the
+/// browser session, so the very next link would prompt again and this would
+/// solve nothing.
+///
+/// The tradeoff is real and worth naming: a token in a URL is visible in
+/// browser history and in any referrer. That is acceptable HERE because
+/// this server binds loopback and the link is generated for the one user
+/// who already holds the token — but it is why this is a separate route
+/// rather than something `/{session}` accepts, so a URL only carries a
+/// credential when someone deliberately asked for a linkable one.
+pub async fn open_session_handler(
+    State(state): State<AppState>,
+    session: Option<AxumPath<String>>,
+    Query(params): Query<OpenSessionQuery>,
+) -> impl IntoResponse {
+    let target = match session {
+        Some(AxumPath(name)) => format!("/{}", name),
+        None => "/".to_string(),
+    };
+
+    let Ok(session_token) = create_session_token(&params.token, true) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "invalid authentication token",
+        )
+            .into_response();
+    };
+
+    let cookie = Cookie::build(("session_token", session_token))
+        .http_only(true)
+        .secure(state.is_https)
+        .same_site(SameSite::Strict)
+        .path("/")
+        .max_age(time::Duration::weeks(4))
+        .build();
+
+    let mut response = axum::response::Redirect::to(&target).into_response();
+    if let Ok(cookie_header) = axum::http::HeaderValue::from_str(&cookie.to_string()) {
+        response.headers_mut().insert("set-cookie", cookie_header);
+    }
+    response
 }
 
 pub async fn login_handler(

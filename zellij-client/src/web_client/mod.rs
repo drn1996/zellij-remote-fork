@@ -44,8 +44,8 @@ use zellij_utils::input::{config::Config, options::Options};
 
 use authentication::auth_middleware;
 use http_handlers::{
-    create_new_client, get_static_asset, list_sessions_handler, login_handler, serve_html,
-    version_handler,
+    create_new_client, get_static_asset, list_sessions_handler, login_handler,
+    open_session_handler, serve_html, version_handler,
 };
 use ipc_listener::listen_to_web_server_instructions;
 
@@ -245,6 +245,11 @@ pub async fn serve_web_client(
         .route("/{session}", get(serve_html))
         .route("/assets/{*path}", get(get_static_asset))
         .route("/command/login", post(login_handler))
+        // Deliberately OUTSIDE the auth layer: this route IS the
+        // authentication step, reached by clicking a link rather than by
+        // posting a form (see `open_session_handler`).
+        .route("/open", get(open_session_handler))
+        .route("/open/{session}", get(open_session_handler))
         .route("/info/version", get(version_handler))
         .with_state(state)
         .layer(axum::middleware::from_fn(move |request, next: axum::middleware::Next| {

@@ -515,6 +515,21 @@ async fn dispatch(
             .await?;
             Ok(json!({ "pane_id": pane_id, "name": name }))
         },
+        Command::SessionResize {
+            session,
+            rows,
+            cols,
+        } => {
+            let link = link_for(state, &session).await?;
+            let (default_rows, default_cols) = SessionLink::default_focus_size();
+            let rows = rows.unwrap_or(default_rows);
+            let cols = cols.unwrap_or(default_cols);
+            if rows == 0 || cols == 0 {
+                return Err("rows and cols must both be greater than zero".to_string());
+            }
+            link.resize_focus_client(rows, cols);
+            Ok(json!({ "session": session, "rows": rows, "cols": cols }))
+        },
         Command::PaneResize {
             session,
             pane_id,

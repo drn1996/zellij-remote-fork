@@ -285,6 +285,31 @@ impl SessionLink {
         });
     }
 
+    /// Resize the focus client, which resizes what the session renders.
+    ///
+    /// A tab renders at the size of the SMALLEST attached client, and the
+    /// focus client declares 999×999 precisely so it is never that minimum
+    /// (see `FOCUS_CLIENT_ROWS`). The consequence is that with no other
+    /// client attached the session really is 999 rows tall — fine for
+    /// reading text, useless for photographing, because the live output
+    /// sits a thousand rows below anything a picture can frame.
+    ///
+    /// So a caller that needs a real terminal geometry sets one here, does
+    /// its work, and puts it back. Restoring matters: leaving the focus
+    /// client small would silently cap every later `read_screen` to that
+    /// size, turning a capture into a lasting change to what the session
+    /// is.
+    pub fn resize_focus_client(&self, rows: usize, cols: usize) {
+        self.focus.send_to_server(ClientToServerMsg::TerminalResize {
+            new_size: Size { rows, cols },
+        });
+    }
+
+    /// The size the focus client declares when nothing has overridden it.
+    pub fn default_focus_size() -> (usize, usize) {
+        (FOCUS_CLIENT_ROWS, FOCUS_CLIENT_COLS)
+    }
+
     /// Subscribe to this session's event stream.
     pub fn events(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()

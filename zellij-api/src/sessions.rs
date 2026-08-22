@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use zellij_client::os_input_output::{get_cli_client_os_input, ClientOsApi};
 use zellij_client::spawn_server;
-use zellij_utils::data::LayoutInfo;
+use zellij_utils::data::{LayoutInfo, WebSharing};
 use zellij_utils::envs;
 use zellij_utils::input::cli_assets::CliAssets;
 use zellij_utils::input::options::Options;
@@ -239,6 +239,24 @@ fn api_session_options() -> Options {
     Options {
         show_release_notes: Some(false),
         show_startup_tips: Some(false),
+        // Web clients are permitted because a session created through this
+        // API exists to be driven and observed by a program, and the web UI
+        // is the only way to SEE one as a picture — the control API returns
+        // plain text lines with no styling, so `read_image` renders through
+        // the web client or not at all.
+        //
+        // `WebSharing` defaults to `Off`, and that default is what made
+        // every capture fail in a thoroughly misleading way: the terminal
+        // WebSocket upgraded with 101 and was then closed by the server, so
+        // the browser showed "CONNECTION LOST" and the picture came back as
+        // a screenshot of that dialog. `/session-list` reported
+        // `web_clients_allowed: false` for every session, which is the only
+        // place the real reason was visible.
+        //
+        // Scoped deliberately: this applies ONLY to sessions this API
+        // creates, never to ones started in a terminal, and the web server
+        // it enables binds loopback and requires its own login token.
+        web_sharing: Some(WebSharing::On),
         ..Default::default()
     }
 }

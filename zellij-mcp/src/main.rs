@@ -10,6 +10,7 @@
 //! control surface itself.
 
 mod tools;
+mod web_capture;
 mod ws_client;
 
 use std::net::{IpAddr, SocketAddr};
@@ -53,6 +54,45 @@ struct Args {
     /// Token for the underlying zellij-api server.
     #[clap(long, env = "ZELLIJ_API_TOKEN")]
     api_token: String,
+
+    /// Base URL of Zellij's own web server, which `read_image` screenshots.
+    /// A separate service from the api-server above — start it with
+    /// `zellij web`.
+    #[clap(
+        long,
+        default_value = "http://127.0.0.1:8082",
+        env = "ZELLIJ_WEB_URL"
+    )]
+    web_url: String,
+
+    /// Token for the web server (`zellij web --create-token`). Omit if that
+    /// server was started without authentication.
+    #[clap(long, env = "ZELLIJ_WEB_TOKEN")]
+    web_token: Option<String>,
+
+    /// How long to let a session's terminal paint before `read_image`
+    /// captures it. The web UI renders progressively as its own WebSocket
+    /// connects, so capturing immediately catches a blank canvas.
+    #[clap(long, default_value = "600", env = "ZELLIJ_WEB_SETTLE_MS")]
+    web_settle_ms: u64,
+
+    /// Which binary to start the web server with, if it is not already
+    /// running. Defaults to the remote-control build this MCP server drives,
+    /// NOT plain `zellij`: both default to port 8082 and each serves only
+    /// its own sessions, so starting the wrong one yields a web server that
+    /// answers and cannot see the session you asked about.
+    #[clap(long, default_value = "zellij-remote", env = "ZELLIJ_WEB_BINARY")]
+    web_binary: String,
+
+    /// Width in pixels of the window `read_image` renders the terminal into.
+    /// This is what decides how much of the screen the picture contains —
+    /// see `WebCaptureConfig::new`.
+    #[clap(long, default_value = "1600", env = "ZELLIJ_WEB_VIEWPORT_WIDTH")]
+    web_viewport_width: u32,
+
+    /// Height in pixels of that window.
+    #[clap(long, default_value = "1000", env = "ZELLIJ_WEB_VIEWPORT_HEIGHT")]
+    web_viewport_height: u32,
 }
 
 #[derive(Clone)]
@@ -107,10 +147,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let api = ApiClient::new(&args.api_url, &args.api_token);
+    let web = web_capture::WebCaptureConfig::new(
+        args.web_url,
+        args.web_token,
+        args.web_settle_ms,
+        args.web_binary,
+        (args.web_viewport_width, args.web_viewport_height),
+    );
 
     let session_manager = std::sync::Arc::new(LocalSessionManager::default());
     let service = StreamableHttpService::new(
-        move || Ok(ZellijTools::new(api.clone())),
+        move || Ok(ZellijTools::new(api.clone(), web.clone())),
         session_manager,
         StreamableHttpServerConfig::default(),
     );

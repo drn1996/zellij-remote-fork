@@ -276,6 +276,12 @@ pub struct LoginRequest {
     pub remember_me: Option<bool>,
 }
 
+/// The token carried by a linkable session URL — see `open_session_handler`.
+#[derive(Deserialize)]
+pub struct OpenSessionQuery {
+    pub token: String,
+}
+
 #[derive(Serialize)]
 pub struct LoginResponse {
     pub success: bool,

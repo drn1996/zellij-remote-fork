@@ -16,11 +16,14 @@ use rmcp::model::{
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde_json::{json, Value};
 
+use crate::web_capture::{capture_session, WebCaptureConfig};
 use crate::ws_client::ApiClient;
 
 #[derive(Clone)]
 pub struct ZellijTools {
     api: ApiClient,
+    /// Where `read_image` finds Zellij's web UI — see `web_capture.rs`
+    web: WebCaptureConfig,
     tool_router: ToolRouter<ZellijTools>,
 }
 
@@ -43,6 +46,53 @@ fn err_result(message: impl Into<String>) -> Result<CallToolResult, McpError> {
     )]))
 }
 
+/// How many consecutive blank/whitespace-only lines to allow through
+/// verbatim before collapsing the run into one placeholder line. A pane's
+/// canvas is padded out to its full terminal size (often 999 rows for the
+/// MCP's own oversized focus client — see `attach_focus_client` in
+/// `session_link.rs`), so real content is frequently followed by hundreds
+/// of empty rows that carry no information but cost real tokens to read.
+const BLANK_RUN_THRESHOLD: usize = 3;
+
+/// Collapse long runs of blank lines in a `screen.snapshot` reply's `lines`
+/// array down to a single `"... N blank lines ..."` marker, leaving short
+/// runs (a couple of blank lines between real content, which are usually
+/// meaningful spacing) untouched. Applied to every snapshot this server
+/// returns to a caller — the underlying canvas itself is not touched, only
+/// the copy handed back over MCP.
+fn collapse_blank_lines(mut value: Value) -> Value {
+    let Some(lines) = value.get_mut("lines").and_then(Value::as_array_mut) else {
+        return value;
+    };
+    let mut collapsed = Vec::with_capacity(lines.len());
+    let mut blank_run = 0usize;
+    let flush = |collapsed: &mut Vec<Value>, run: usize| {
+        if run == 0 {
+            return;
+        }
+        if run <= BLANK_RUN_THRESHOLD {
+            for _ in 0..run {
+                collapsed.push(Value::String(String::new()));
+            }
+        } else {
+            collapsed.push(Value::String(format!("... {run} blank lines ...")));
+        }
+    };
+    for line in lines.drain(..) {
+        let is_blank = line.as_str().is_some_and(|s| s.trim().is_empty());
+        if is_blank {
+            blank_run += 1;
+            continue;
+        }
+        flush(&mut collapsed, blank_run);
+        blank_run = 0;
+        collapsed.push(line);
+    }
+    flush(&mut collapsed, blank_run);
+    *lines = collapsed;
+    value
+}
+
 // --- parameter types --------------------------------------------------------
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -57,8 +107,10 @@ pub struct CreateSessionParams {
     #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
+    #[schemars(schema_with = "tab_id_schema")]
     pub rows: Option<usize>,
     #[serde(default)]
+    #[schemars(schema_with = "tab_id_schema")]
     pub cols: Option<usize>,
 }
 
@@ -87,15 +139,36 @@ pub struct CreateTabParams {
     pub cwd: Option<String>,
 }
 
+/// A non-negative integer, as a schema with NO `format` keyword.
+///
+/// `u64` derives `{"type": "integer", "format": "uint64"}`, and the schema
+/// converters these tools pass through do not know that format — they log
+/// `unknown format "uint64" ignored in schema at path "#/properties/tab_id"`
+/// and drop it. A keyword being silently discarded on the way to a model
+/// provider is not something to leave in place: what reaches the provider
+/// is then not what this file says, and the difference is invisible from
+/// here.
+///
+/// `minimum: 0` carries the only constraint that actually mattered — these
+/// are all counts and ids — in a keyword every consumer understands.
+fn tab_id_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "integer",
+        "minimum": 0
+    })
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct TabIdParams {
     pub session: String,
+    #[schemars(schema_with = "tab_id_schema")]
     pub tab_id: u64,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RenameTabParams {
     pub session: String,
+    #[schemars(schema_with = "tab_id_schema")]
     pub tab_id: u64,
     pub name: String,
 }
@@ -123,6 +196,7 @@ pub struct CreatePaneParams {
     pub name: Option<String>,
     /// Which tab to create the pane in. Defaults to the session's active tab.
     #[serde(default)]
+    #[schemars(schema_with = "tab_id_schema")]
     pub tab_id: Option<u64>,
 }
 
@@ -176,8 +250,10 @@ pub struct SendMouseParams {
     /// `press`, `release`, or `motion`.
     pub kind: String,
     /// Column, 0-based.
+    #[schemars(schema_with = "tab_id_schema")]
     pub x: u16,
     /// Row, 0-based.
+    #[schemars(schema_with = "tab_id_schema")]
     pub y: u16,
     /// `left`, `right`, `middle`, `wheel_up`, `wheel_down`. Defaults to `left`.
     #[serde(default)]
@@ -193,6 +269,17 @@ pub struct ReadScreenParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ReadImageParams {
+    pub session: String,
+    /// Which tab to photograph. Focused for you before the capture.
+    #[schemars(schema_with = "tab_id_schema")]
+    pub tab_id: u64,
+    /// Which pane to photograph. Focused for you before the capture, which
+    /// also brings its tab forward.
+    pub pane_id: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ScreenHistoryParams {
     pub session: String,
     /// Which pane's history to read. Omit to target the focused pane.
@@ -200,8 +287,10 @@ pub struct ScreenHistoryParams {
     pub pane_id: Option<String>,
     /// Only diffs newer than this version.
     #[serde(default)]
+    #[schemars(schema_with = "tab_id_schema")]
     pub since: Option<u64>,
     #[serde(default)]
+    #[schemars(schema_with = "tab_id_schema")]
     pub limit: Option<usize>,
 }
 
@@ -209,9 +298,10 @@ pub struct ScreenHistoryParams {
 
 #[tool_router]
 impl ZellijTools {
-    pub fn new(api: ApiClient) -> Self {
+    pub fn new(api: ApiClient, web: WebCaptureConfig) -> Self {
         Self {
             api,
+            web,
             tool_router: Self::tool_router(),
         }
     }
@@ -326,7 +416,7 @@ impl ZellijTools {
                     snapshot = self.api.call(command.clone()).await;
                 }
                 match snapshot {
-                    Ok(snapshot) => screens.push(snapshot),
+                    Ok(snapshot) => screens.push(collapse_blank_lines(snapshot)),
                     Err(e) => {
                         // Report the miss in the result itself, not just the
                         // log — a caller reading `screens` should not have
@@ -526,6 +616,98 @@ impl ZellijTools {
     // --- screen ---------------------------------------------------------------
 
     #[tool(
+        description = "Look at a pane as a PICTURE — a real screenshot of the terminal, rendered \
+                        by Zellij's own web UI. Use this when the text of the screen is not \
+                        enough: box-drawn panels, colour-coded state, progress meters, rendered \
+                        menus, or anything where layout carries the meaning. `read_screen` is the \
+                        right tool for plain text, and is cheaper. The tab and pane you name are \
+                        FOCUSED for you first, so the picture is always of what you asked for \
+                        rather than of whatever happened to be on screen. Starts Zellij's web \
+                        server itself if it is not already running."
+    )]
+    async fn read_image(
+        &self,
+        Parameters(p): Parameters<ReadImageParams>,
+    ) -> Result<CallToolResult, McpError> {
+        // Focus, then capture. The web UI renders one screen per session —
+        // whatever is currently focused — so without this the picture is of
+        // wherever focus happened to be, and a caller asking for a specific
+        // pane would get a confident answer about the wrong one.
+        //
+        // The tab first, then the pane: `pane.focus` brings its tab forward
+        // on its own, but naming both means a caller who gives a pane that
+        // is not in the tab they named gets an error from the pane focus
+        // rather than a silently mismatched screenshot.
+        if let Err(e) = self
+            .api
+            .call(json!({"cmd": "tab.focus", "session": p.session, "tab_id": p.tab_id}))
+            .await
+        {
+            return err_result(format!("could not focus tab {} to photograph it: {e}", p.tab_id));
+        }
+        if let Err(e) = self
+            .api
+            .call(json!({"cmd": "pane.focus", "session": p.session, "pane_id": p.pane_id}))
+            .await
+        {
+            return err_result(format!(
+                "could not focus pane {} to photograph it: {e}",
+                p.pane_id
+            ));
+        }
+
+        // Give the session a real terminal geometry for the duration of the
+        // capture, then put it back.
+        //
+        // Its focus client declares 999x999 so it is never the size-limiting
+        // client, which means an API-driven session genuinely IS ~999 rows
+        // tall. A picture of that frames the first forty rows and misses the
+        // live output entirely — confirmed against a session whose marker
+        // `read_screen` showed plainly and whose screenshot did not contain
+        // it at all.
+        //
+        // Restoring is not optional: leaving the session small would cap
+        // every later `read_screen` to these dimensions, so a request to
+        // LOOK at a session would quietly change what the session is. The
+        // restore runs on the failure path too, for the same reason.
+        let resize = |rows: Option<u32>, cols: Option<u32>| {
+            let session = p.session.clone();
+            async move {
+                self.api
+                    .call(json!({
+                        "cmd": "session.resize", "session": session,
+                        "rows": rows, "cols": cols,
+                    }))
+                    .await
+            }
+        };
+
+        let (rows, cols) = self.web.capture_grid();
+        if let Err(e) = resize(Some(rows), Some(cols)).await {
+            return err_result(format!("could not size session {} for capture: {e}", p.session));
+        }
+
+        let captured = capture_session(&self.web, &p.session).await;
+        let restored = resize(None, None).await;
+
+        match (captured, restored) {
+            (Ok(base64_png), Ok(_)) => Ok(CallToolResult::success(vec![ContentBlock::image(
+                base64_png,
+                "image/png",
+            )])),
+            // A capture that cannot be handed back with the session restored
+            // is reported as a failure rather than returned: the caller would
+            // otherwise get a good picture and a session left resized, with
+            // nothing saying so.
+            (Ok(_), Err(e)) => err_result(format!(
+                "captured session {} but could not restore its size afterwards: {e}",
+                p.session
+            )),
+            (Err(e), _) => err_result(e),
+        }
+    }
+
+    #[tool(
         description = "Read a pane's current on-screen content. Auto-subscribes to it first if it \
                         was not already followed."
     )]
@@ -533,44 +715,56 @@ impl ZellijTools {
         &self,
         Parameters(p): Parameters<ReadScreenParams>,
     ) -> Result<CallToolResult, McpError> {
+        // `screen.snapshot` reads a canvas cache that a background observer
+        // thread fills asynchronously from `PaneRenderUpdate` pushes — it is
+        // NOT computed fresh on demand. Under a burst of PTY output (a busy
+        // TUI spinner, a long command's streaming output) the observer
+        // thread can lag behind what the server has already sent, so a
+        // snapshot taken right then returns genuinely stale content: not a
+        // logic bug in the diff/version tracking, just an eventually-
+        // consistent cache read before consistency has actually landed.
+        // Confirmed in practice: a second `read_screen` moments later (or a
+        // resubscribe) reliably picks up the fresh content once the observer
+        // thread catches up.
+        //
+        // `screen.subscribe`'s reply is just an ack; the actual baseline
+        // content lands separately as an `is_initial: true`
+        // `PaneRenderUpdate`, itself queried synchronously against LIVE pane
+        // state at the moment the server handles the subscribe (see
+        // `subscribe_to_pane_renders` in zellij-server/src/screen.rs) — so
+        // resubscribing forces a fresh requery rather than trusting whatever
+        // is already sitting in the cache. Do this unconditionally, not just
+        // as an error fallback, then retry the snapshot with short backoff
+        // until that fresh push has actually been applied.
+        let subscribe_command = match &p.pane_id {
+            Some(pane_id) => json!({
+                "cmd": "screen.subscribe", "session": p.session,
+                "pane_ids": [pane_id],
+            }),
+            None => json!({"cmd": "screen.subscribe", "session": p.session}),
+        };
+        if let Err(e) = self.api.call(subscribe_command).await {
+            // A subscribe failure (e.g. no such pane) is more specific than
+            // whatever a snapshot attempt would report — surface it
+            // directly instead of falling through to a vaguer error.
+            return err_result(e);
+        }
+
         let snapshot_command = json!({
             "cmd": "screen.snapshot", "session": p.session, "pane_id": p.pane_id,
         });
-        let mut snapshot = self.api.call(snapshot_command.clone()).await;
-        if snapshot.is_err() {
-            // Not yet followed — subscribe, then retry. The subscription's
-            // baseline arrives asynchronously (a render event, not part of
-            // the subscribe reply), so give it a few short beats rather than
-            // trying once and giving up.
-            //
-            // A subscribe failure (e.g. no such pane) is usually more
-            // specific than whatever the snapshot attempt above returned —
-            // surface it directly rather than falling through to a vaguer
-            // "still couldn't snapshot" error.
-            //
-            // With no `pane_id` given, the target is "whichever pane is
-            // focused" — that can only be resolved session-side, so follow
-            // every pane instead of naming one.
-            let subscribe_command = match &p.pane_id {
-                Some(pane_id) => json!({
-                    "cmd": "screen.subscribe", "session": p.session,
-                    "pane_ids": [pane_id],
-                }),
-                None => json!({"cmd": "screen.subscribe", "session": p.session}),
-            };
-            if let Err(e) = self.api.call(subscribe_command).await {
-                return err_result(e);
+        let mut snapshot = Err("no snapshot attempt made yet".to_string());
+        for attempt in 0..8 {
+            snapshot = self.api.call(snapshot_command.clone()).await;
+            if snapshot.is_ok() {
+                break;
             }
-            for _ in 0..8 {
-                snapshot = self.api.call(snapshot_command.clone()).await;
-                if snapshot.is_ok() {
-                    break;
-                }
+            if attempt < 7 {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
         match snapshot {
-            Ok(value) => ok_json(value),
+            Ok(value) => ok_json(collapse_blank_lines(value)),
             Err(e) => err_result(e),
         }
     }

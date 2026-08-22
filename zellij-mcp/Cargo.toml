@@ -23,6 +23,13 @@ anyhow = { workspace = true }
 log = { workspace = true }
 uuid = { workspace = true }
 clap = { workspace = true }
+# `read_image` drives Zellij's own web UI in a headless browser rather than
+# reimplementing terminal rendering here — see `web_capture.rs`.
+# No `fetcher` feature: that exists to DOWNLOAD a Chrome build, and this
+# machine already has one. Pulling it in also drags a zip/TLS stack into a
+# server whose job is to take screenshots.
+chromiumoxide = { version = "0.9", default-features = false }
+base64 = "0.22"
 
 [[bin]]
 name = "zellij-mcp"

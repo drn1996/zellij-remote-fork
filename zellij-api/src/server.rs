@@ -632,10 +632,31 @@ async fn dispatch(
                 None => None,
             };
             let follow_all = targets.is_none();
-            let subscribed = link.subscribe(targets).await?;
 
+            // Forwarding starts BEFORE subscribing, and the order is
+            // load-bearing. Events go out over a broadcast channel, which
+            // delivers nothing sent before a receiver exists — and subscribing
+            // makes the session send its current screen immediately, which the
+            // canvas records as version 0 and announces as `screen.reset`.
+            //
+            // Started after, that baseline was dropped every time: the caller
+            // saw a successful subscribe, the server held canvas state, and no
+            // event ever arrived. For a session that then sat idle, the client
+            // never heard anything at all.
             streams.stop(&session);
             let mut handles = vec![forward_events(link.clone(), out.clone())];
+
+            let subscribed = match link.subscribe(targets).await {
+                Ok(subscribed) => subscribed,
+                // Do not leave a forwarder running for a subscribe that failed.
+                Err(e) => {
+                    for handle in handles {
+                        handle.abort();
+                    }
+                    return Err(e);
+                },
+            };
+
             if follow_all {
                 handles.push(poll_pane_set(link.clone()));
             }

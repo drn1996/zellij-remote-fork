@@ -1,7 +1,7 @@
 //! Session lifecycle: listing, creating, killing, and keeping one live
 //! [`SessionLink`] per session that the API is driving.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,9 +9,9 @@ use std::time::Duration;
 use serde::Serialize;
 
 use zellij_client::os_input_output::{get_cli_client_os_input, ClientOsApi};
-use zellij_client::spawn_server;
+use zellij_client::spawn_server_with_env;
 use zellij_utils::data::{LayoutInfo, WebSharing};
-use zellij_utils::envs;
+use zellij_utils::envs::SESSION_NAME_ENV_KEY;
 use zellij_utils::input::cli_assets::CliAssets;
 use zellij_utils::input::options::Options;
 use zellij_utils::ipc::{ClientToServerMsg, ServerToClientMsg};
@@ -44,9 +44,25 @@ pub struct SessionSummary {
 #[derive(Default)]
 pub struct SessionManager {
     links: Mutex<HashMap<String, Arc<SessionLink>>>,
-    /// Session creation writes a process-wide env var that the spawned server
-    /// inherits, so only one creation may be in flight at a time.
-    creation: Mutex<()>,
+    /// Names of sessions currently being created. Creations run concurrently
+    /// (the spawned server gets its name through its own environment, not a
+    /// process-wide variable), so this set is what keeps two in-flight
+    /// creations from claiming the same name.
+    starting: Mutex<HashSet<String>>,
+}
+
+/// Removes a reserved name from [`SessionManager::starting`] however creation
+/// exits, success or error.
+#[derive(Debug)]
+struct StartingReservation<'a> {
+    starting: &'a Mutex<HashSet<String>>,
+    name: String,
+}
+
+impl Drop for StartingReservation<'_> {
+    fn drop(&mut self) {
+        self.starting.lock().unwrap().remove(&self.name);
+    }
 }
 
 impl SessionManager {
@@ -146,17 +162,7 @@ impl SessionManager {
         rows: Option<usize>,
         cols: Option<usize>,
     ) -> Result<String, String> {
-        let _guard = self.creation.lock().unwrap();
-
-        let session_name = match name {
-            Some(name) => name,
-            None => generate_unique_session_name()
-                .ok_or_else(|| "could not generate a session name".to_string())?,
-        };
-        validate_session_name(&session_name)?;
-        if session_exists(&session_name).unwrap_or(false) {
-            return Err(format!("session '{}' already exists", session_name));
-        }
+        let (session_name, _reservation) = self.reserve_name(name)?;
 
         let socket_path = session_socket_path(&session_name);
         // Note: `validate_session_name` above already rejects a name whose
@@ -167,9 +173,10 @@ impl SessionManager {
         // enough to send anything back, and would otherwise just block for
         // the full timeout instead of failing immediately with a message
         // that says why.
-        // The spawned server inherits this and uses it to identify itself.
-        envs::set_session_name(session_name.clone());
-        spawn_server(&socket_path, false)
+        // The spawned server reads this from its own environment to identify
+        // itself. Set on the child only — a process-wide variable here would
+        // race with concurrent creations.
+        spawn_server_with_env(&socket_path, false, &[(SESSION_NAME_ENV_KEY, &session_name)])
             .map_err(|e| format!("could not spawn the session server: {}", e))?;
 
         let os_input =
@@ -202,7 +209,36 @@ impl SessionManager {
         wait_until_started(&os_input)?;
         os_input.send_to_server(ClientToServerMsg::ClientExited);
 
+        log::info!("session '{}' is up", session_name);
         Ok(session_name)
+    }
+
+    /// Claim `wanted` (or a generated name) as being-created, failing if it is
+    /// already running or already being created by a concurrent call. The
+    /// returned reservation frees the claim when dropped, however creation
+    /// exits — so a failed creation never blocks the name forever.
+    fn reserve_name(
+        &self,
+        wanted: Option<String>,
+    ) -> Result<(String, StartingReservation<'_>), String> {
+        let mut starting = self.starting.lock().unwrap();
+        let session_name = match wanted {
+            Some(name) => name,
+            None => generate_unique_session_name()
+                .ok_or_else(|| "could not generate a session name".to_string())?,
+        };
+        validate_session_name(&session_name)?;
+        if starting.contains(&session_name) || session_exists(&session_name).unwrap_or(false) {
+            return Err(format!("session '{}' already exists", session_name));
+        }
+        starting.insert(session_name.clone());
+        Ok((
+            session_name.clone(),
+            StartingReservation {
+                starting: &self.starting,
+                name: session_name,
+            },
+        ))
     }
 
     pub fn kill(&self, session_name: &str) -> Result<(), String> {
@@ -362,5 +398,75 @@ mod tests {
         let manager = SessionManager::new();
         assert!(manager.link("zellij-api-definitely-not-a-session").is_err());
         assert!(manager.linked_sessions().is_empty());
+    }
+
+    #[test]
+    fn a_name_already_being_created_cannot_be_claimed_again() {
+        let manager = SessionManager::new();
+        let name = "zellij-api-test-reservation".to_string();
+
+        let held = manager.reserve_name(Some(name.clone())).expect("first claim");
+
+        let second = manager.reserve_name(Some(name.clone()));
+        assert!(second.is_err(), "a concurrent claim on the same name must be refused");
+        assert!(second.unwrap_err().contains("already exists"));
+        drop(held);
+    }
+
+    #[test]
+    fn dropping_a_reservation_frees_the_name_for_the_next_attempt() {
+        let manager = SessionManager::new();
+        let name = "zellij-api-test-retry".to_string();
+
+        let first = manager.reserve_name(Some(name.clone())).expect("first claim");
+        drop(first);
+
+        // A failed creation drops its reservation on the way out — the same
+        // name must then be claimable again rather than blocked forever.
+        assert!(manager.reserve_name(Some(name)).is_ok());
+    }
+
+    #[test]
+    fn concurrent_generated_reservations_never_collide() {
+        let manager = std::sync::Arc::new(SessionManager::new());
+
+        let claims: Vec<_> = (0..16)
+            .map(|_| {
+                let manager = manager.clone();
+                std::thread::spawn(move || {
+                    manager.reserve_name(None).map(|(name, reservation)| {
+                        // Hold the reservation long enough for the others to
+                        // run, as overlapping creations would.
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        drop(reservation);
+                        name
+                    })
+                })
+            })
+            .collect();
+
+        let mut names: Vec<String> =
+            claims.into_iter().map(|t| t.join().unwrap().expect("a generated claim")).collect();
+        let total = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), total, "every concurrent creation must get a distinct name");
+    }
+
+    #[test]
+    fn a_reservation_is_freed_even_when_creation_fails() {
+        let manager = SessionManager::new();
+        let name = "zellij-api-test-failed-create".to_string();
+
+        // This create fails long after the name is reserved (there is no
+        // real zellij server to talk to in a unit test).
+        let result = manager.create(Some(name.clone()), None, None, None, None);
+        assert!(result.is_err());
+
+        // The failure must not leave the name permanently claimed.
+        assert!(
+            manager.reserve_name(Some(name)).is_ok(),
+            "a failed creation must release its name reservation"
+        );
     }
 }

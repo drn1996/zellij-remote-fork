@@ -443,10 +443,26 @@ fn create_ipc_pipe(teardown: Option<TerminalTeardown>) -> PathBuf {
 /// the intermediate child exits immediately and `cmd.status()` returns.
 #[cfg(not(windows))]
 pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
+    spawn_server_with_env(socket_path, debug, &[])
+}
+
+/// Like [`spawn_server`], but with extra environment variables set on the
+/// child only. Callers that identify the session through the environment
+/// (`ZELLIJ_SESSION_NAME`) can pass it here instead of mutating the parent's
+/// process-wide environment, which would race with concurrent spawns.
+#[cfg(not(windows))]
+pub fn spawn_server_with_env(
+    socket_path: &Path,
+    debug: bool,
+    envs: &[(&str, &str)],
+) -> io::Result<()> {
     let mut cmd = Command::new(current_exe()?);
     cmd.arg("--server").arg(socket_path);
     if debug {
         cmd.arg("--debug");
+    }
+    for (key, value) in envs {
+        cmd.env(key, value);
     }
     let status = cmd.status()?;
     if status.success() {
@@ -470,11 +486,25 @@ pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
 /// creation, WASM plugin loading, and logging.
 #[cfg(windows)]
 pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
+    spawn_server_with_env(socket_path, debug, &[])
+}
+
+/// Like [`spawn_server`], but with extra environment variables set on the
+/// child only. See the Unix variant for why.
+#[cfg(windows)]
+pub fn spawn_server_with_env(
+    socket_path: &Path,
+    debug: bool,
+    envs: &[(&str, &str)],
+) -> io::Result<()> {
     use std::os::windows::process::CommandExt;
     let mut cmd = Command::new(current_exe()?);
     cmd.arg("--server").arg(socket_path);
     if debug {
         cmd.arg("--debug");
+    }
+    for (key, value) in envs {
+        cmd.env(key, value);
     }
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;

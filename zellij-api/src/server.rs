@@ -46,9 +46,19 @@ use crate::sessions::SessionManager;
 /// failed to, not as a matter of course.
 const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// How many session creations may run at once. Creation forks a server
+/// process and blocks on its startup IPC, so it is expensive; a burst beyond
+/// this bound queues (fairly, in arrival order) instead of stampeding the
+/// machine. The wait for a permit is deliberately *outside* [`CALL_TIMEOUT`]:
+/// queueing is the intended behaviour under load, and the caller's own
+/// timeout bounds how long it is willing to wait overall.
+const CREATE_CONCURRENCY: usize = 6;
+
 #[derive(Clone)]
 pub struct ApiState {
     pub sessions: Arc<SessionManager>,
+    /// Bounds concurrent session creations; see [`CREATE_CONCURRENCY`].
+    pub create_permits: Arc<tokio::sync::Semaphore>,
     /// When set, callers must present `?token=...` to connect.
     pub token: Option<String>,
 }
@@ -70,6 +80,7 @@ pub fn router(state: ApiState) -> Router {
 pub async fn serve(addr: SocketAddr, token: Option<String>) -> anyhow::Result<()> {
     let state = ApiState {
         sessions: Arc::new(SessionManager::new()),
+        create_permits: Arc::new(tokio::sync::Semaphore::new(CREATE_CONCURRENCY)),
         token,
     };
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -231,6 +242,22 @@ async fn dispatch(
             cols,
         } => {
             let sessions = state.sessions.clone();
+            // Queue for a creation slot first — see `CREATE_CONCURRENCY` for
+            // why this wait sits outside the timeout below.
+            let queued_at = std::time::Instant::now();
+            let _permit = state
+                .create_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| "the server is shutting down".to_string())?;
+            let waited = queued_at.elapsed();
+            if waited > std::time::Duration::from_millis(100) {
+                log::info!(
+                    "session.create waited {}ms for a creation slot",
+                    waited.as_millis()
+                );
+            }
             // Session creation spawns a process and blocks on IPC, so keep it
             // off the async runtime's worker threads.
             //
@@ -246,6 +273,7 @@ async fn dispatch(
             // of hanging forever. The blocked OS thread itself is abandoned,
             // not killed — Tokio has no way to force that — but the caller
             // is unblocked either way, which is what actually matters here.
+            let started_at = std::time::Instant::now();
             let outcome = tokio::time::timeout(
                 CALL_TIMEOUT,
                 tokio::task::spawn_blocking(move || sessions.create(name, layout, cwd, rows, cols)),
@@ -253,6 +281,11 @@ async fn dispatch(
             .await
             .map_err(|_| "timed out creating the session".to_string())?
             .map_err(|e| format!("session creation panicked: {}", e))??;
+            log::info!(
+                "created session '{}' in {}ms",
+                outcome,
+                started_at.elapsed().as_millis()
+            );
             Ok(json!({ "session": outcome }))
         },
         Command::SessionKill { name } => {
